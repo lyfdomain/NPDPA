@@ -1,0 +1,278 @@
+import copy
+from lifelines.utils import concordance_index
+import torch
+import csv
+import torch.nn as nn
+import torch.optim as optim
+# import matplotlib.pyplot as plt
+import numpy as np
+from torch.nn import functional
+import sklearn
+from sklearn.manifold import TSNE
+from sklearn.metrics import roc_auc_score, average_precision_score, r2_score
+from sklearn.metrics.pairwise import cosine_similarity
+from utils_repo import *
+from repo_model import *
+from scipy import stats
+import time
+import os
+from tqdm import trange
+
+
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+#device = torch.device("cuda:0" )
+# use_cuda = torch.cuda.is_available()
+# Prepare for rm2
+def get_k(y_obs, y_pred):
+    y_obs = np.array(y_obs)
+    y_pred = np.array(y_pred)
+    return sum(y_obs * y_pred) / sum(y_pred ** 2)
+
+# Prepare for rm2
+def squared_error_zero(y_obs, y_pred):
+    k = get_k(y_obs, y_pred)
+    y_obs = np.array(y_obs)
+    y_pred = np.array(y_pred)
+    y_obs_mean = np.mean(y_obs)
+    upp = sum((y_obs - k * y_pred) ** 2)
+    down = sum((y_obs - y_obs_mean) ** 2)
+
+    return 1 - (upp / down)
+
+
+# Prepare for rm2
+def r_squared_error(y_obs, y_pred):
+    y_obs = np.array(y_obs)
+    y_pred = np.array(y_pred)
+    y_obs_mean = np.mean(y_obs)
+    y_pred_mean = np.mean(y_pred)
+    mult = sum((y_obs - y_obs_mean) * (y_pred - y_pred_mean)) ** 2
+    y_obs_sq = sum((y_obs - y_obs_mean) ** 2)
+    y_pred_sq = sum((y_pred - y_pred_mean) ** 2)
+    return mult / (y_obs_sq * y_pred_sq)
+
+
+
+def get_rm2(Y, P):
+
+    r2 = r_squared_error(Y, P)
+    r02 = squared_error_zero(Y, P)
+
+    return r2 * (1 - np.sqrt(np.absolute(r2 ** 2 - r02 ** 2)))
+
+
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")#第一行代码
+# device = torch.device("cpu")#第一行代码
+
+def drug_rowsimm(dd):
+    mm = np.zeros(dd.shape)
+    for i in range(dd.shape[0]):
+        # for j in range(dd.shape[1]):
+        if np.sum(dd[i, :])!=0:
+           mm[i, :] = dd[i, :] / np.sum(dd[i, :])
+    mm[mm < 0] = 0
+    return mm
+
+
+def dis_colsimm(dd):
+    mm = np.zeros(dd.shape)
+    for j in range(dd.shape[1]):
+            if np.sum(dd[:, j]) != 0:
+                mm[:, j] = dd[:, j] / np.sum(dd[:, j])
+    mm[mm < 0] = 0
+    return mm
+
+# seednum = 50
+for seednum in [10, 20, 30, 40, 50, 60, 70, 80, 90]:
+
+    torch.manual_seed(seednum)
+    jihe = "PDB2020"
+    
+    drug_data=[]
+    leraning_rate=0.00001
+    hidden_size = 256
+    num_epochs = 2000
+    morgan_dim = 1024
+    # morgan_dim = 2048
+    wet=12
+    #
+    with open("./"+jihe+"/train.csv", newline='') as csvfile:
+        reader = csv.reader(csvfile, delimiter=',', quotechar='"')
+        next(reader)
+        for row in reader:
+            # 处理每一行数据
+            drug_data.append(row)
+    drug_data= np.array(drug_data)
+    
+    val_data = []
+    with open("./" + jihe + "/valid.csv", newline='') as csvfile:
+        reader = csv.reader(csvfile, delimiter=',', quotechar='"')
+        next(reader)
+        for row in reader:
+            val_data.append(row)
+    val_data = np.array(val_data)
+    
+    #
+    dti = np.loadtxt("./" + jihe + "/dti.txt")#.astype(dtype="int64")
+
+    SR = np.loadtxt("./" + jihe + "/DS.txt")
+    SP = np.loadtxt('./'+jihe+'/PS.txt')
+    
+    for i in range(len(SP)):
+        SP[i]=SP[i]/SP[i][i]
+        for j in range(len(SP[0])):
+            if SP[i][j]<0:
+                SP[i][j]=0
+    
+    
+    # SR = sim_recon(SR, 3)
+    # SP = sim_recon(SP, 3)
+    SR = sim_recon(SR, 1/3)
+    SP = sim_recon(SP, 1/3)
+    
+    
+    cof1 = np.zeros(SR.shape)
+    cof1[SR >= 0.1] = 1
+    SR[SR < 0.1] = 0
+    
+    cof2 = np.zeros(SP.shape)
+    cof2[SP >= 0.01] = 1
+    SP[SP < 0.01] = 0
+    
+    
+    SR = drug_rowsimm(SR)
+    SP = drug_rowsimm(SP)
+    
+    
+    
+    dru = np.loadtxt("./" + jihe + "/drug.txt", dtype=str, comments=None)
+    pro = np.loadtxt("./" + jihe + "/protein.txt", dtype=str)
+    
+    drug=list(dru)
+    protein=list(pro)
+    
+    pp=np.loadtxt("./" + jihe + "/esm_PDB2020.txt", delimiter=",")
+    tt = np.loadtxt("./PDB2020/mol2vec_pdb2020_rep.txt")
+    
+    
+    ind_val = []
+    for i in range(len(val_data)):
+        if val_data[i, 0] in drug and val_data[i, 1] in protein:
+            ind_val.append([drug.index(val_data[i, 0]), protein.index(val_data[i, 1])])
+    
+    tr = []
+    for i in range(len(ind_val)):
+        tr.append(dti[ind_val[i][0], ind_val[i][1]])
+    
+    auc_max=0
+    
+    def test(e, f):
+        output1 = e.detach().cpu().numpy()
+        output2 = f.detach().cpu().numpy()
+        pre = wet * cosine_similarity(output1, output2)
+        # pre = output1@(output2.T)
+        pr = []
+        for i in range(len(ind_val)):
+            pr.append(pre[ind_val[i][0], ind_val[i][1]])
+        return pr
+    #
+    cof = np.zeros(dti.shape)
+    ind = []
+    for i in range(len(drug_data)):
+        if drug_data[i,0] in drug and drug_data[i,1] in protein:
+            ind.append([drug.index(drug_data[i,0]), protein.index(drug_data[i,1])])
+    
+    for i in range(len(ind)):
+        cof[ind[i][0], ind[i][1]] = 1
+    
+    dti = torch.from_numpy(dti).float().to(device)
+    cof = torch.from_numpy(cof).float().to(device)
+    x = torch.from_numpy(tt).float().to(device)
+    y = torch.from_numpy(pp).float().to(device)
+    sr = torch.from_numpy(SR).float().to(device)
+    sp = torch.from_numpy(SP).float().to(device)
+
+    input_size = len(tt[0])
+    input_size2 = len(pp[0])
+    autoencoder = Autoencoder(input_size, input_size2, hidden_size)
+    autoencoder = autoencoder.to(device)
+    
+    model_max = copy.deepcopy(autoencoder)
+    # criterion = nn.MSELoss()
+    
+    criterion2 = AEFSLoss()
+    optimizer = optim.Adam(autoencoder.parameters(), lr=leraning_rate)
+    
+
+    for epoch in trange(num_epochs):
+        autoencoder.train()
+        optimizer.zero_grad()
+        e, f = autoencoder(x, y, sr, sp)
+        # loss1 = criterion2(e, f, dti, cof)
+        loss1 = criterion2(e, sr, f, sp, dti, cof)
+    
+        reg = get_l2reg(autoencoder.parameters())
+        loss = 1 * loss1 + 0.00005*reg
+    
+        loss.backward()
+        optimizer.step()
+        # print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, loss.cpu().item()))
+    
+        autoencoder.eval()
+        pr = test(e, f)
+        area= np.sqrt(sklearn.metrics.mean_squared_error(tr, pr))
+        person, _ = stats.pearsonr(tr, pr)
+        spman, _ = stats.spearmanr(tr, pr)
+        CI = concordance_index(tr, pr)
+        R2 = r2_score(tr, pr)
+        RM = get_rm2(tr, pr)
+        aps = sklearn.metrics.mean_absolute_error(tr, pr)
+        if CI > auc_max:
+            auc_max = CI
+            model_max = copy.deepcopy(autoencoder)
+            # model_max = autoencoder
+        if epoch%100==0:
+            print(area, aps, person, spman, CI, R2, RM, "AUC_min", auc_max)
+    
+    torch.save(model_max.cpu(), 'copdb_predti.pth')
+    
+    
+    # model = torch.load('copdb_predti.pth')
+    
+    # start= time.time()
+    
+    model = model_max.cpu()
+    model.eval()
+    
+    ind1 = list(np.loadtxt("./"+ jihe +"/index_test.txt").astype(dtype="int64"))
+    
+    # print(model)
+    x=torch.from_numpy(tt).float()
+    y=torch.from_numpy(pp).float()
+    dti=np.loadtxt("./" + jihe + "/dti.txt")#.astype(dtype="int64")
+    
+    
+    output1, output2 = model(x, y, sr, sp)
+    
+    output1 = output1.detach().numpy()
+    output2 = output2.detach().numpy()
+    
+    
+    pre = wet * cosine_similarity(output1, output2)
+    
+
+    prr=[]
+    trr=[]
+    for i in range(len(ind1)):
+        prr.append(pre[ind1[i]//12621,ind1[i]%12621])
+        trr.append(dti[ind1[i]//12621,ind1[i]%12621])
+    
+    area= np.sqrt(sklearn.metrics.mean_squared_error(trr, prr))
+    person, _ = stats.pearsonr(trr, prr)
+    spman, _ = stats.spearmanr(trr, prr)
+    aps = sklearn.metrics.mean_absolute_error(trr, prr)
+    CI = concordance_index(trr, prr)
+    R2 = r2_score(trr, prr)
+    RM = get_rm2(trr, prr)
+    print(area, aps, person, spman, R2, RM, CI, "TEST")
+
