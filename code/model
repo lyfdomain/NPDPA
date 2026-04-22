@@ -1,0 +1,53 @@
+import torch.nn as nn
+import torch
+from torch_geometric.nn import GATConv
+class Autoencoder(nn.Module):
+    def __init__(self, input_size, input_size2, hidden_size):
+        super(Autoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_size, 2048),  # 输入层
+            nn.BatchNorm1d(2048),
+            nn.ReLU(),
+            nn.Linear(2048, 512),  # 隐藏层1
+            nn.Tanh(),
+        )
+
+
+        self.decoder = nn.Sequential(
+            nn.Linear(input_size2, 2048),  # 隐藏层1
+            nn.BatchNorm1d(2048),
+            nn.ReLU(),
+            nn.Linear(2048, 512),  # 隐藏层2
+            nn.Tanh(),
+        )
+
+    def forward(self, x, y, sr, sp):
+        encoded = self.encoder(x)
+        encoded = torch.mm(sr, encoded)
+        decoded = self.decoder(y)
+        decoded = torch.mm(sp, decoded)
+        
+        return encoded, decoded
+
+
+class AEFSLoss(nn.Module):
+    def __init__(self):
+        super().__init__()  # 没有需要保存的参数和状态信息
+
+    def forward(self, e, sr, f, sp, dti, cof):  # 定义前向的函数运算即可
+        losf = torch.nn.MSELoss(reduction='sum')
+
+        Sd = e - torch.mm(sr, e)
+        los1 = torch.sum(Sd ** 2) #/ (Sd.shape[0] )
+
+        Sp = f-torch.mm(sp, f)
+        los2 = torch.sum(Sp ** 2) #/ (Sp.shape[0])
+
+
+        S3 = torch.mm(e, f.T)
+        sn3 = torch.mm(torch.sqrt_(torch.sum(e.mul(e), dim=1).view(torch.sum(e.mul(e), dim=1).shape[0], 1)),
+                       torch.sqrt_(torch.sum(f.mul(f), dim=1).view(1, torch.sum(f.mul(f), dim=1).shape[0])))
+        SN3 = 12*torch.div(S3, sn3)
+        los = 0.001 * los1 + 0.002 * los2 + 1 * los3
+
+        return los
